@@ -234,17 +234,60 @@ controls.maxDistance = 1200;
 const sunGroup = new THREE.Group();
 scene.add(sunGroup);
 
+const sunVertexShader = `
+  varying vec2 vUv;
+  varying vec3 vNormal;
+  void main() {
+    vUv = uv;
+    vNormal = normalize(normalMatrix * normal);
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  }
+`;
+
+const sunFragmentShader = `
+  void main() {
+    gl_FragColor = vec4(1.0, 0.6, 0.1, 1.0); // Simple orange
+  }
+`;
+
+const sunMaterial = new THREE.ShaderMaterial({
+  uniforms: {
+    time: { value: 0 }
+  },
+  vertexShader: sunVertexShader,
+  fragmentShader: sunFragmentShader,
+});
+
 const sun = new THREE.Mesh(
   new THREE.SphereGeometry(8, 64, 64),
-  new THREE.MeshBasicMaterial({ color: 0xffcc33 })
+  sunMaterial
 );
 sunGroup.add(sun);
 
-// Glow halo
-sun.add(new THREE.Mesh(
-  new THREE.SphereGeometry(8.6, 32, 32),
-  new THREE.MeshBasicMaterial({ color: 0xffaa22, transparent: true, opacity: 0.25, side: THREE.BackSide })
-));
+// Create a more prominent, soft glow with a procedurally generated sprite
+const glowSize = 32;
+const glowMaterial = new THREE.SpriteMaterial({
+    map: new THREE.CanvasTexture( (function() {
+        const canvas = document.createElement('canvas');
+        canvas.width = 128;
+        canvas.height = 128;
+        const context = canvas.getContext('2d');
+        const gradient = context.createRadialGradient(
+            canvas.width / 2, canvas.height / 2, 0,
+            canvas.width / 2, canvas.height / 2, canvas.width / 2
+        );
+        gradient.addColorStop(0.0, 'rgba(255, 220, 150, 0.6)');
+        gradient.addColorStop(0.4, 'rgba(255, 180, 0, 0.3)');
+        gradient.addColorStop(1.0, 'rgba(255, 150, 0, 0.0)');
+        context.fillStyle = gradient;
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        return canvas;
+    }()) ),
+    blending: THREE.AdditiveBlending
+});
+const sunGlow = new THREE.Sprite(glowMaterial);
+sunGlow.scale.set(glowSize, glowSize, glowSize);
+sunGroup.add(sunGlow);
 
 // Sun light
 const sunLight = new THREE.PointLight(0xffffff, 3, 0, 0.4);
@@ -526,11 +569,12 @@ planetData.forEach(p => {
   // Moons
   const moonObjs = [];
   (p.moons || []).forEach(m => {
+    // Each moon gets its own pivot so its orbit can be controlled independently.
     const mPivot = new THREE.Object3D();
     mesh.add(mPivot);
 
     const moonMesh = new THREE.Mesh(
-      new THREE.SphereGeometry(m.size, 24, 24),
+      new THREE.SphereGeometry(m.size, 16, 16),
       new THREE.MeshStandardMaterial({
         map: makeTexture(m.color, { noise: 0.08, spots: 8, spotColor: '#555' }),
         roughness: 0.9
@@ -539,13 +583,18 @@ planetData.forEach(p => {
     moonMesh.position.x = m.distance;
     mPivot.add(moonMesh);
 
-    moonObjs.push({ pivot: mPivot, speed: m.speed });
+    // For Uranus, tilt the moon orbits to match the ring tilt.
+    if (p.ring?.tilt) {
+      mPivot.rotation.y = p.ring.tilt;
+    }
+
+    moonObjs.push({ pivot: mPivot, speed: m.speed, retrograde: m.retrograde });
     allMoons.push(mPivot);
   });
 
   // deg/day this planet actually moves (360 / sidereal period).
   const degPerDay = 360 / p.period;
-  planets.push({ pivot, mesh, degPerDay, spin: p.spin, moons: moonObjs });
+  planets.push({ name: p.name, pivot, mesh, degPerDay, spin: p.spin, moons: moonObjs });
 });
 
 /* =========================================================
@@ -596,6 +645,46 @@ function updateClock() {
 updateClock();
 
 /* =========================================================
+   Click to focus on a planet
+   ========================================================= */
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+let targetFocus = null; // The object mesh to focus on (planet or sun)
+
+window.addEventListener('click', (event) => {
+  // convert mouse coords to normalized device coordinates (-1 to +1)
+  mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+
+  // Check for intersection with planets or the sun
+  const planetMeshes = planets.map(p => p.mesh);
+  const intersects = raycaster.intersectObjects([sun, ...planetMeshes]);
+
+  if (intersects.length > 0) {
+    // If something was hit, set it as the new focus target.
+    targetFocus = intersects[0].object;
+  }
+});
+
+// Smoothly animate camera and controls target to the focused object
+function updateFocus() {
+  if (!targetFocus) return;
+
+  const targetPos = new THREE.Vector3();
+  targetFocus.getWorldPosition(targetPos);
+
+  // Smoothly move (lerp) the controls target towards the planet's position
+  controls.target.lerp(targetPos, 0.08);
+
+  // If we're close enough, stop the animation to prevent jitter
+  if (controls.target.distanceTo(targetPos) < 0.01) {
+    targetFocus = null;
+  }
+}
+
+/* =========================================================
    Animation loop.
    Each planet advances by its REAL orbital motion:
    delta-longitude = (360 / sidereal_period) * simulatedDays.
@@ -604,23 +693,25 @@ updateClock();
    ========================================================= */
 const clock = new THREE.Clock();
 function animate() {
-  const dt = clock.getDelta();
-  const simDays = dt * daysPerSec;        // simulated days elapsed this frame
+  // Get time elapsed since page load, and apply the speed multiplier.
+  // This gives us a 'simulated' time that is always based on the real world clock.
+  const elapsedSeconds = clock.getElapsedTime();
+  const simulatedTime = new Date(realNow.getTime() + elapsedSeconds * daysPerSec * 86400 * 1000);
 
-  // advance the simulated date by the same amount the orbits moved
-  simDate = new Date(simDate.getTime() + simDays * 86400000);
+  // Update the on-screen clock to this new simulated time.
+  simDate = simulatedTime;
   updateClock();
 
-  // sun pulse + rotation
+  const d = daysSinceJ2000(simDate);
   sun.rotation.y += 0.0015;
 
   planets.forEach(p => {
-    // advance by true daily motion (deg/day), convert to radians
-    p.pivot.rotation.y -= p.degPerDay * simDays * Math.PI / 180;
+    // Set the pivot to the planet's REAL current heliocentric longitude.
+    p.pivot.rotation.y = -heliocentricLongitude(p, d) * Math.PI / 180;
     p.mesh.rotation.y  += p.spin * (1 + daysPerSec / 10);
-    p.moons.forEach(m => (m.pivot.rotation.y += simDays * m.speed * 0.05));
   });
 
+  updateFocus();
   controls.update();
   renderer.render(scene, camera);
   requestAnimationFrame(animate);
